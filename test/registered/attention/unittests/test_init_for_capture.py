@@ -129,6 +129,87 @@ class TestInitForCaptureParity(CustomTestCase):
 
         _assert_fb_equal(factory, reference)
 
+    def test_full_graph_with_canary(self) -> None:
+        """Mirror full-graph capture with the KV-canary token oracle enabled.
+
+        Guards the factory's forwarding of the per-request identity tensors
+        `rids_int` / `bootstrap_room_ids_int` (sliced from the canary buffers
+        when the token-oracle env flag is set). A regression that drops either
+        field from the factory would surface here.
+        """
+        bs = 4
+        num_tokens = 4
+        input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+        req_pool_indices = torch.arange(bs, dtype=torch.int32)
+        seq_lens = torch.full((bs,), 32, dtype=torch.int32)
+        seq_lens_cpu = seq_lens.clone()
+        out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64)
+        positions = torch.zeros(num_tokens, dtype=torch.int64)
+        mrope_positions = torch.zeros(3, num_tokens, dtype=torch.int64)
+        next_token_logits_buffer = torch.zeros(num_tokens, 256, dtype=torch.float32)
+        num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32)
+        # Length-bs identity tensors mirror `buffers.rids_int[:bs]` etc.; distinct
+        # values so a dropped/zeroed field is caught by the value comparison.
+        rids_int = torch.arange(1, bs + 1, dtype=torch.int64)
+        bootstrap_room_ids_int = torch.arange(1, bs + 1, dtype=torch.int64) + 100
+
+        reference = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            mamba_track_seqlens=None,
+            encoder_lens=None,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=None,
+            mrope_positions=mrope_positions,
+            spec_algorithm=None,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=num_token_non_padded,
+            global_forward_mode=ForwardMode.DECODE,
+            lora_ids=None,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
+        )
+
+        factory = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.FULL_GRAPH,
+            bs=bs,
+            num_tokens=num_tokens,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            positions=positions,
+            orig_seq_lens=seq_lens,
+            next_token_logits_buffer=next_token_logits_buffer,
+            mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
+        )
+
+        # Explicit intent guard: the factory must not drop these to None.
+        self.assertIsNotNone(factory.rids_int)
+        self.assertIsNotNone(factory.bootstrap_room_ids_int)
+        _assert_fb_equal(factory, reference)
+
     def test_piecewise_graph_extend(self) -> None:
         """Mirror `PiecewiseCudaGraphRunner.capture_one_batch_size` (bs=1 extend)."""
         bs = 1
