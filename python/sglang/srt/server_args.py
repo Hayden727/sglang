@@ -1064,6 +1064,10 @@ class ServerArgs:
         # runtime paths keep working while the strategy refactor lands.
         self._sync_cp_legacy_aliases()
 
+        from sglang.srt.layers.cp.strategy import init_cp_strategy
+
+        init_cp_strategy(self)
+
     def _sync_cp_legacy_aliases(self) -> None:
         if not self.enable_prefill_cp:
             return
