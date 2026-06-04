@@ -897,64 +897,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         capture_kind: CaptureKind,
         bs: int,
         num_tokens: int,
-        # Buffer source for the token-axis kinds: the factory derives their
-        # tensor fields from this registry instead of taking them as args.
+        # Buffer sources: token-axis + FULL_GRAPH slice the registry's
+        # graph-resident slots; FULL_GRAPH / DUMMY_RUN also read the
+        # decode-buffer namespace.
         registry: Optional["CudaGraphBufferRegistry"] = None,
-        # Decode-buffer namespace for FULL_GRAPH (and, later, DUMMY_RUN): the
-        # factory reads its non-registry buffer fields from here.
         buffers: Optional["SimpleNamespace"] = None,
-        # Core tensors — passed explicitly by DUMMY_RUN; for the registry-backed
-        # token-axis kinds (PIECEWISE_* / BREAKABLE) the factory derives them.
+        # Per-site value the factory cannot derive from the buffers.
         forward_mode: Optional[ForwardMode] = None,
-        input_ids: Optional[torch.Tensor] = None,
-        req_pool_indices: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        out_cache_loc: Optional[torch.Tensor] = None,
-        seq_lens_sum: Optional[int] = None,
-        positions: Optional[torch.Tensor] = None,
-        # Optional core tensors / mirrors
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-        orig_seq_lens: Optional[torch.Tensor] = None,
-        next_token_logits_buffer: Optional[torch.Tensor] = None,
-        # Mamba state tracking (registered conditionally per feature flag)
-        mamba_track_indices: Optional[torch.Tensor] = None,
-        mamba_track_mask: Optional[torch.Tensor] = None,
-        mamba_track_seqlens: Optional[torch.Tensor] = None,
-        # Encoder-decoder
-        encoder_lens: Optional[torch.Tensor] = None,
-        # Multimodal
-        input_embeds: Optional[torch.Tensor] = None,
-        mrope_positions: Optional[torch.Tensor] = None,
-        # Extend metadata — required for PCG / WARMUP / BREAKABLE; optional
-        # for DUMMY_RUN (depends on is_generation); never set for FULL_GRAPH.
+        # Extend metadata — DUMMY_RUN only (token-axis builds its own; FULL_GRAPH
+        # has none).
         extend_num_tokens: Optional[int] = None,
         extend_seq_lens: Optional[torch.Tensor] = None,
         extend_prefix_lens: Optional[torch.Tensor] = None,
         extend_start_loc: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         extend_seq_lens_cpu: Optional[List[int]] = None,
-        extend_logprob_start_lens_cpu: Optional[List[int]] = None,
         # Spec
         spec_info: Optional["SpecInput"] = None,
         spec_algorithm: Optional["SpeculativeAlgorithm"] = None,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         # DP
         global_forward_mode: Optional[ForwardMode] = None,
-        dp_padding_mode: Optional[DpPaddingMode] = None,
         global_dp_buffer_len: Optional[int] = None,
         global_num_tokens_cpu: Optional[List[int]] = None,
-        global_num_tokens_gpu: Optional[torch.Tensor] = None,
-        global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None,
-        # Padding
-        num_token_non_padded: Optional[torch.Tensor] = None,
-        num_token_non_padded_cpu: Optional[int] = None,
         # LoRA
         lora_ids: Optional[List[Optional[str]]] = None,
         # Pooler
         return_pooled_hidden_states: bool = False,
-        # KV-canary ids (full-graph decode only; off by default)
-        rids_int: Optional[torch.Tensor] = None,
-        bootstrap_room_ids_int: Optional[torch.Tensor] = None,
     ) -> "ForwardBatch":
         """Build a capture-time ForwardBatch for one of the graph-capture sites.
 
@@ -967,17 +936,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             5. `BreakableCudaGraphRunner._build_capture_forward_batch`
                                                                  (BREAKABLE_GRAPH)
 
-        Two construction paths:
+        This is a thin dispatcher to a per-axis builder; each builder derives
+        the tensor fields itself rather than taking them as args:
 
-        * Token-axis kinds (PIECEWISE_* / BREAKABLE) pass only a `registry`
-          plus `bs` / `num_tokens` and a few per-site knobs; every tensor
-          field is derived here — graph-resident slots sliced to the capture
-          shape, plus synthetic bs=1 extend metadata built from `num_tokens`.
+        * Token-axis (PIECEWISE_* / BREAKABLE): `registry` + `bs` /
+          `num_tokens` + a few per-site knobs. Graph-resident slots sliced to
+          the capture shape, plus synthetic bs=1 extend metadata.
 
-        * FULL_GRAPH / DUMMY_RUN stay parameter-by-parameter: the caller
-          slices its own decode buffers and passes the fields explicitly, and
-          per-kind defaults (`dp_padding_mode`, `global_forward_mode`) are
-          filled here.
+        * FULL_GRAPH: `registry` + `buffers`. Reads the graph slots and the
+          decode-buffer namespace (canary ids, global token counts, …).
+
+        * DUMMY_RUN: `buffers` (full, unsliced) + the caller-computed extend
+          metadata.
 
         Must be called *outside* a `torch.cuda.graph(...)` capture scope.
         """
@@ -1036,70 +1006,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 lora_ids=lora_ids,
             )
 
-        assert (
-            forward_mode is not None and input_ids is not None
-        ), "unexpected capture_kind for the parameter-by-parameter path"
-
-        # Per-kind default for global_forward_mode: capture paths mirror the
-        # primary forward_mode unless caller passes an explicit override.
-        if global_forward_mode is None:
-            global_forward_mode = forward_mode
-
-        # Per-kind default for dp_padding_mode. All four kinds historically
-        # use the cuda-graph default unless the caller has a specific one.
-        if dp_padding_mode is None:
-            dp_padding_mode = DpPaddingMode.get_default_mode_in_cuda_graph()
-
-        # Per-kind default for num_token_non_padded_cpu. The PCG / warmup /
-        # breakable sites store num_tokens directly; FULL_GRAPH / DUMMY_RUN
-        # leave it None because the graph buffer already carries the value.
-        if num_token_non_padded_cpu is None and capture_kind in (
-            CaptureKind.PIECEWISE_GRAPH,
-            CaptureKind.PIECEWISE_WARMUP_COMPILE,
-        ):
-            num_token_non_padded_cpu = num_tokens
-
-        return cls(
-            forward_mode=forward_mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            next_token_logits_buffer=next_token_logits_buffer,
-            orig_seq_lens=orig_seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens_sum,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
-            encoder_lens=encoder_lens,
-            return_logprob=False,
-            input_embeds=input_embeds,
-            positions=positions,
-            extend_num_tokens=extend_num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_start_loc=extend_start_loc,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
-            global_num_tokens_cpu=global_num_tokens_cpu,
-            global_num_tokens_gpu=global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=dp_padding_mode,
-            global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=mrope_positions,
-            spec_algorithm=spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=num_token_non_padded,
-            num_token_non_padded_cpu=num_token_non_padded_cpu,
-            global_forward_mode=global_forward_mode,
-            lora_ids=lora_ids,
-            return_pooled_hidden_states=return_pooled_hidden_states,
-            rids_int=rids_int,
-            bootstrap_room_ids_int=bootstrap_room_ids_int,
+        raise AssertionError(
+            f"init_for_capture: unhandled capture_kind {capture_kind!r}"
         )
 
     @classmethod
