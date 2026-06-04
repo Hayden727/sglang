@@ -845,29 +845,10 @@ class CudaGraphRunner:
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Graph inputs: owned slots come from the registry; the rest off `buffers`.
+        # The factory pulls the graph-resident slots + decode buffers itself;
+        # input_ids is also needed below for the dp-gather tensor device.
         registry = self.buffer_registry
-
-        def _slot(name):
-            return registry.get_slot(name).slice_for(bs, num_tokens)
-
-        input_ids = _slot("input_ids")
-        req_pool_indices = _slot("req_pool_indices")
-        seq_lens = _slot("seq_lens")
-        seq_lens_cpu = _slot("seq_lens_cpu")
-        out_cache_loc = _slot("out_cache_loc")
-        positions = _slot("positions")
-        encoder_lens = (
-            _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
-        )
-        mrope_positions = _slot("mrope_positions")
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
-        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
-        bootstrap_room_ids_int = (
-            buffers.bootstrap_room_ids_int[:bs]
-            if buffers.bootstrap_room_ids_int is not None
-            else None
-        )
+        input_ids = registry.get_slot("input_ids").slice_for(bs, num_tokens)
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
@@ -919,16 +900,6 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
-        # mamba state tracking (registry-owned when enabled)
-        mamba_track_indices = (
-            _slot("mamba_track_indices")
-            if registry.has_slot("mamba_track_indices")
-            else None
-        )
-        mamba_track_mask = (
-            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
-        )
-
         if stream_idx is None:
             attn_backend = self.attn_backend
         else:
@@ -937,34 +908,16 @@ class CudaGraphRunner:
 
         forward_batch = ForwardBatch.init_for_capture(
             capture_kind=CaptureKind.FULL_GRAPH,
+            registry=registry,
+            buffers=buffers,
             bs=bs,
             num_tokens=num_tokens,
             forward_mode=self.capture_forward_mode,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            next_token_logits_buffer=next_token_logits_buffer,
-            orig_seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=None,  # Prefill only
-            encoder_lens=encoder_lens,
-            positions=positions,
-            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            spec_algorithm=self.model_runner.spec_algorithm,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
-            rids_int=rids_int,
-            bootstrap_room_ids_int=bootstrap_room_ids_int,
+            global_dp_buffer_len=global_dp_buffer_len,
         )
 
         # Trip the coordinator so the hisparse code path is captured into the

@@ -66,6 +66,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from types import SimpleNamespace
+
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -898,7 +900,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Buffer source for the token-axis kinds: the factory derives their
         # tensor fields from this registry instead of taking them as args.
         registry: Optional["CudaGraphBufferRegistry"] = None,
-        # Core tensors — passed explicitly by FULL_GRAPH / DUMMY_RUN; for the
+        # Decode-buffer namespace for FULL_GRAPH (and, later, DUMMY_RUN): the
+        # factory reads its non-registry buffer fields from here.
+        buffers: Optional["SimpleNamespace"] = None,
+        # Core tensors — passed explicitly by DUMMY_RUN; for the registry-backed
         # token-axis kinds (PIECEWISE_* / BREAKABLE) the factory derives them.
         forward_mode: Optional[ForwardMode] = None,
         input_ids: Optional[torch.Tensor] = None,
@@ -995,9 +1000,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 return_pooled_hidden_states=return_pooled_hidden_states,
             )
 
+        if capture_kind is CaptureKind.FULL_GRAPH:
+            return cls._init_full_graph_capture(
+                registry=registry,
+                buffers=buffers,
+                bs=bs,
+                num_tokens=num_tokens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                spec_algorithm=spec_algorithm,
+                capture_hidden_mode=capture_hidden_mode,
+                lora_ids=lora_ids,
+                global_dp_buffer_len=global_dp_buffer_len,
+                global_forward_mode=global_forward_mode,
+            )
+
         assert (
             forward_mode is not None and input_ids is not None
-        ), "FULL_GRAPH / DUMMY_RUN capture must pass forward_mode and core tensors"
+        ), "DUMMY_RUN capture must pass forward_mode and core tensors"
 
         # Per-kind default for global_forward_mode: capture paths mirror the
         # primary forward_mode unless caller passes an explicit override.
@@ -1176,6 +1196,89 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=ForwardMode.EXTEND,
             lora_ids=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
+        )
+
+    @classmethod
+    def _init_full_graph_capture(
+        cls,
+        *,
+        registry: Optional["CudaGraphBufferRegistry"],
+        buffers: Optional["SimpleNamespace"],
+        bs: int,
+        num_tokens: int,
+        forward_mode: Optional[ForwardMode],
+        spec_info: Optional["SpecInput"] = None,
+        spec_algorithm: Optional["SpeculativeAlgorithm"] = None,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        lora_ids: Optional[List[Optional[str]]] = None,
+        global_dp_buffer_len: Optional[int] = None,
+        global_forward_mode: Optional[ForwardMode] = None,
+    ) -> "ForwardBatch":
+        """Build a full-graph (decode) capture ForwardBatch.
+
+        Tensor fields come from the registry's graph-resident slots (sliced to
+        the capture shape) and the decode-buffer namespace. The caller still
+        owns the surrounding capture logic — buffer mutation, dp gather, and
+        the spec / lora / capture_hidden_mode computation — and passes those
+        results in.
+        """
+        assert (
+            registry is not None and buffers is not None
+        ), "full-graph capture requires a buffer registry + decode buffers"
+
+        def _slot(name: str) -> torch.Tensor:
+            return registry.get_slot(name).slice_for(bs, num_tokens)
+
+        seq_lens = _slot("seq_lens")
+        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:bs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
+        if global_forward_mode is None:
+            global_forward_mode = forward_mode
+
+        return cls(
+            forward_mode=forward_mode,
+            batch_size=bs,
+            input_ids=_slot("input_ids"),
+            req_pool_indices=_slot("req_pool_indices"),
+            seq_lens=seq_lens,
+            seq_lens_cpu=_slot("seq_lens_cpu"),
+            next_token_logits_buffer=buffers.next_token_logits_buffer[:num_tokens],
+            orig_seq_lens=seq_lens,
+            out_cache_loc=_slot("out_cache_loc"),
+            seq_lens_sum=seq_lens.sum().item(),
+            mamba_track_indices=(
+                _slot("mamba_track_indices")
+                if registry.has_slot("mamba_track_indices")
+                else None
+            ),
+            mamba_track_mask=(
+                _slot("mamba_track_mask")
+                if registry.has_slot("mamba_track_mask")
+                else None
+            ),
+            mamba_track_seqlens=None,  # Prefill only
+            encoder_lens=(
+                _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
+            ),
+            return_logprob=False,
+            positions=_slot("positions"),
+            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            mrope_positions=_slot("mrope_positions"),
+            spec_algorithm=spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=capture_hidden_mode,
+            num_token_non_padded=buffers.num_token_non_padded,
+            global_forward_mode=global_forward_mode,
+            lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:

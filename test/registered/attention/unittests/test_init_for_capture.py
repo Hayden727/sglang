@@ -18,6 +18,7 @@ and any future ad-hoc construction at a capture entry point.
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -139,20 +140,26 @@ class TestInitForCaptureParity(CustomTestCase):
 
         factory = ForwardBatch.init_for_capture(
             capture_kind=CaptureKind.FULL_GRAPH,
+            registry=_FakeRegistry(
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                positions=positions,
+                mrope_positions=mrope_positions,
+            ),
+            buffers=SimpleNamespace(
+                next_token_logits_buffer=next_token_logits_buffer,
+                num_token_non_padded=num_token_non_padded,
+                global_num_tokens_gpu=None,
+                global_num_tokens_for_logprob_gpu=None,
+                rids_int=None,
+                bootstrap_room_ids_int=None,
+            ),
             bs=bs,
             num_tokens=num_tokens,
             forward_mode=ForwardMode.DECODE,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=int(seq_lens.sum().item()),
-            positions=positions,
-            orig_seq_lens=seq_lens,
-            next_token_logits_buffer=next_token_logits_buffer,
-            mrope_positions=mrope_positions,
-            num_token_non_padded=num_token_non_padded,
         )
 
         _assert_fb_equal(factory, reference)
@@ -215,22 +222,26 @@ class TestInitForCaptureParity(CustomTestCase):
 
         factory = ForwardBatch.init_for_capture(
             capture_kind=CaptureKind.FULL_GRAPH,
+            registry=_FakeRegistry(
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                positions=positions,
+                mrope_positions=mrope_positions,
+            ),
+            buffers=SimpleNamespace(
+                next_token_logits_buffer=next_token_logits_buffer,
+                num_token_non_padded=num_token_non_padded,
+                global_num_tokens_gpu=None,
+                global_num_tokens_for_logprob_gpu=None,
+                rids_int=rids_int,
+                bootstrap_room_ids_int=bootstrap_room_ids_int,
+            ),
             bs=bs,
             num_tokens=num_tokens,
             forward_mode=ForwardMode.DECODE,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=int(seq_lens.sum().item()),
-            positions=positions,
-            orig_seq_lens=seq_lens,
-            next_token_logits_buffer=next_token_logits_buffer,
-            mrope_positions=mrope_positions,
-            num_token_non_padded=num_token_non_padded,
-            rids_int=rids_int,
-            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
         # Explicit intent guard: the factory must not drop these to None.
