@@ -27,14 +27,14 @@ class JointThreshold(DllmAlgorithm):
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-    ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
+    ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, None, bool]:
         batch_size = forward_batch.batch_size
         device = forward_batch.input_ids.device
 
         mask_index = forward_batch.input_ids == self.mask_id
         if not mask_index.any():
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            return out.logits_output, [], out.can_run_graph
+            return out.logits_output, [], None, out.can_run_graph
 
         start_list = []
         prompt_masks = []
@@ -133,7 +133,7 @@ class JointThreshold(DllmAlgorithm):
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
 
-        return logits_output, next_token_ids_list, can_run_cuda_graph
+        return logits_output, next_token_ids_list, None, can_run_cuda_graph
 
 
 Algorithm = JointThreshold
